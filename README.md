@@ -3,6 +3,9 @@
 This project implements an interactive chatbot that provides answers based on customer product reviews and uploaded PDF documentation. It leverages advanced AI techniques, including **Retrieval-Augmented Generation (RAG)** using **Mistral-7B-Instruct-v0.3**, embeddings with **SentenceTransformers**, and document storage with **ChromaDB**.
 
 ---
+## Demo video link
+
+- https://drive.google.com/drive/folders/17ZZctC2_lSw6D73z3x96hMnDl0m84WuZ
 
 ## 🚀 Features
 
