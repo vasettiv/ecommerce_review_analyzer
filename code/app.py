@@ -1,215 +1,229 @@
-# %%
-
-import os
 import streamlit as st
-import pandas as pd
-import fitz
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
 import chromadb
 from chromadb.config import Settings
-import tempfile
+import pandas as pd
+import fitz
+import os
+from pathlib import Path
 import uuid
-from collections import defaultdict, Counter
-from datetime import datetime
-import matplotlib.pyplot as plt
+import tempfile
 
-# --- Config
-CSV_PATH = "/home/ubuntu/final_project_capstone/data/sample.csv"
-CHROMA_PATH = "/home/ubuntu/final_project_capstone/chroma_db"
+# ---------------------- Config ----------------------
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+BASE_DIR = Path(__file__).resolve().parent
+CSV_PATH = os.getenv("CSV_PATH", str((BASE_DIR / "../data/sample.csv").resolve()))
+DEFAULT_PDF_PATH = os.getenv("DEFAULT_PDF_PATH", str((BASE_DIR / "../data/Amazon_Tap_Quick_Start_Guide.pdf").resolve()))
+CHROMA_PATH = os.getenv("CHROMA_PATH", str((BASE_DIR / "../chroma_db").resolve()))
 
-# --- Setup
-st.set_page_config(page_title="🔍 ReviewBot AI", layout="wide", page_icon="🤖")
+# ---------------------- UI Setup ----------------------
+st.set_page_config(page_title="ReviewBot AI", layout="wide", page_icon="🤖")
+st.markdown("""
+    <style>
+        .block-container { background-color: #0d1117; color: white; padding: 2rem 3rem 3rem; border-radius: 1rem; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .stTextInput > div > div > input { background-color: #161b22; color: white; }
+        .stButton > button { background-color: #238636; color: white; font-weight: bold; }
+        .stCheckbox > label { font-weight: bold; color: white; }
+    </style>
+""", unsafe_allow_html=True)
 
-with st.container():
-    st.markdown("""
-        <div style="text-align:center;">
-            <img src="https://upload.wikimedia.org/wikipedia/commons/a/a9/Amazon_logo.svg" width="150">
-        </div>
-        <style>
-            .block-container {
-                padding: 2rem 3rem 3rem;
-                background-color: #0d1117;
-                border-radius: 1rem;
-                color: white;
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                animation: fadein 1s ease-in-out;
-            }
-            @keyframes fadein {
-                0% {opacity: 0; transform: translateY(10px);}
-                100% {opacity: 1; transform: translateY(0);}
-            }
-            .stTextInput > div > div > input {
-                background-color: #161b22;
-                color: white;
-                font-size: 1rem;
-                padding: 0.5rem;
-            }
-            .stButton > button {
-                background-color: #238636;
-                color: white;
-                font-weight: bold;
-                font-size: 1rem;
-            }
-            .stCheckbox > label {
-                font-weight: bold;
-                color: white;
-            }
-        </style>
-    """, unsafe_allow_html=True)
+st.title("🤖 Product QA and Review Chatbot")
+st.markdown("Ask **product-related questions** and get **context-aware answers** from reviews and manuals.")
 
-st.title("🤖 Amazon Product Review Chatbot")
-st.markdown("Ask **product-related questions** and get **context-aware answers** from reviews and uploaded manuals.")
-
-# --- Embedder & Reranker
-embedder = SentenceTransformer("BAAI/bge-large-en-v1.5")
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-
-client = chromadb.Client(Settings(persist_directory=CHROMA_PATH, anonymized_telemetry=False))
-collection = client.get_or_create_collection("reviews")
-
-# --- LLM (Mistral fallback with safe config)
+# ---------------------- Loaders ----------------------
 @st.cache_resource
-def load_mistral():
+def load_reviews():
+    df = pd.read_csv(CSV_PATH)
+    return [f"{str(title).strip()}. {str(text).strip()}" for title, text in zip(df["reviews.title"], df["reviews.text"])]
+
+@st.cache_resource
+def get_embedder():
+    return SentenceTransformer("BAAI/bge-large-en-v1.5")
+
+@st.cache_resource
+def get_reranker():
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+@st.cache_resource
+def get_generator():
     model_id = "mistralai/Mistral-7B-Instruct-v0.3"
+    bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype="float16")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        device_map="auto",
-        trust_remote_code=True,
-        torch_dtype="auto"
+        model_id, device_map="auto", quantization_config=bnb_config, trust_remote_code=True
     )
     return pipeline("text-generation", model=model, tokenizer=tokenizer)
 
-generator = load_mistral()
+@st.cache_resource
+def get_chroma_collection(documents):
+    embedder = get_embedder()
+    client = chromadb.Client(Settings(persist_directory=CHROMA_PATH, anonymized_telemetry=False))
+    collection = client.get_or_create_collection(name="reviews")
+    if collection.count() == 0:
+        embeddings = embedder.encode(documents).tolist()
+        collection.add(
+            documents=documents,
+            embeddings=embeddings,
+            ids=[f"doc{i}" for i in range(len(documents))],
+            metadatas=[{"source": "csv"} for _ in documents]
+        )
+    return collection
 
-# --- Loaders
+# ---------------------- PDF & CSV Helpers ----------------------
+def extract_text_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    return "\n".join(page.get_text() for page in doc).strip()
 
-def load_csv(csv_path):
-    df = pd.read_csv(csv_path)
-    docs = [f"{str(t).strip()}. {str(r).strip()}" for t, r in zip(df["reviews.title"], df["reviews.text"])]
-    metas = [{"source": "csv", "timestamp": str(datetime.now()), "rating": str(row.get("reviews.rating", "0"))} for _, row in df.iterrows()]
-    return docs, metas
+def add_pdf_to_chromadb(collection, pdf_path):
+    embedder = get_embedder()
+    text = extract_text_from_pdf(pdf_path)
+    chunks = [text[i:i + 1000] for i in range(0, len(text), 1000)]
+    embeddings = embedder.encode(chunks).tolist()
+    doc_ids = [f"pdfdoc_{Path(pdf_path).stem}_{uuid.uuid4()}_{i}" for i in range(len(chunks))]
+    collection.add(
+        documents=chunks,
+        embeddings=embeddings,
+        ids=doc_ids,
+        metadatas=[{"source": "pdf", "filename": Path(pdf_path).name} for _ in chunks]
+    )
+    return len(chunks)
 
-def load_pdf_chunks(path, chunk_size=1000):
-    doc = fitz.open(path)
-    text = "\n".join(page.get_text() for page in doc)
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    metas = [{"source": "pdf", "filename": os.path.basename(path), "timestamp": str(datetime.now())} for _ in chunks]
-    return chunks, metas
+# ---------------------- QA Function ----------------------
+def ask_question(query, history, collection, rerank=True):
+    embedder = get_embedder()
+    reranker = get_reranker()
+    generator = get_generator()
 
-def add_to_chroma(docs, metas, prefix):
-    embeds = embedder.encode(docs, batch_size=32).tolist()
-    ids = [f"{prefix}_{uuid.uuid4()}_{i}" for i in range(len(docs))]
-    collection.add(documents=docs, embeddings=embeds, metadatas=metas, ids=ids)
+    query_embedding = embedder.encode([query]).tolist()
+    results = collection.query(query_embeddings=query_embedding, n_results=30)
+    docs = results["documents"][0]
+    metas = results["metadatas"][0]
 
-# --- Load CSV Reviews once
-if "csv_loaded" not in st.session_state:
+    if rerank:
+        scores = reranker.predict([(query, doc) for doc in docs])
+        ranked = sorted(zip(scores, docs, metas), reverse=True)[:10]
+    else:
+        ranked = [(1.0, doc, meta) for doc, meta in zip(docs, metas)][:10]
+
+    context = "\n".join([doc for _, doc, _ in ranked])
+    history_text = "\n".join([f"Q: {q}\nA: {a}" for q, a in history])
+    prompt = (
+        f"You are a helpful assistant answering product-related questions based on the provided documents. "
+        f"Use the previous chat history and the following context to answer the current question. "
+        f"Answer truthfully. If unsure, say 'I don't know'.\n\n"
+        f"Chat History:\n{history_text}\n\n"
+        f"Context:\n{context}\n\n"
+        f"User: {query}\nAssistant:"
+    )
+    response = generator(prompt, max_new_tokens=300)[0]["generated_text"]
+    return response.split("Assistant:")[-1].strip(), ranked
+
+# ---------------------- Load Default Data ----------------------
+documents = load_reviews()
+collection = get_chroma_collection(documents)
+
+if "default_pdf_loaded" not in st.session_state:
     try:
-        docs, metas = load_csv(CSV_PATH)
-        add_to_chroma(docs, metas, "csv")
-        st.session_state.csv_loaded = True
+        added_chunks = add_pdf_to_chromadb(collection, DEFAULT_PDF_PATH)
+        st.session_state.default_pdf_loaded = True
+        st.sidebar.info(f"📄 Default manual loaded with {added_chunks} chunks.")
     except Exception as e:
-        st.error(f"❌ Failed to load reviews: {e}")
+        st.sidebar.error(f"❌ Failed to load default PDF: {e}")
 
-# --- PDF Upload
-st.sidebar.header("📄 Upload Product Manual")
-pdf_file = st.sidebar.file_uploader("Upload PDF", type=["pdf"])
-if pdf_file:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(pdf_file.read())
-        chunks, metas = load_pdf_chunks(tmp.name)
-        add_to_chroma(chunks, metas, "pdf")
-        st.sidebar.success(f"✅ Uploaded {pdf_file.name}")
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
-# --- Ask a Question
-st.subheader("💬 Ask a Product Question")
-query = st.text_input("Type your question here...")
-rerank_enabled = st.checkbox("⚙️ Use reranker for better accuracy", value=True)
-show_sources = st.checkbox("📎 Show source documents", value=False)
+# ---------------------- Sidebar: Upload PDF (Append) ----------------------
+with st.sidebar:
+    st.header("📄 Upload Extra PDF Manual")
+    uploaded_file = st.file_uploader("Upload PDF", type="pdf")
+    if uploaded_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(uploaded_file.read())
+            count = add_pdf_to_chromadb(collection, str(tmp.name))
+            st.success(f"✅ Added {count} chunks from {uploaded_file.name}")
+            os.remove(tmp.name)
 
-if st.button("🔍 Get Answer") and query:
-    with st.spinner("🤖 Thinking..."):
+# ---------------------- Sidebar: Upload New Product (Replace) ----------------------
+st.sidebar.markdown("### 🔄 Switch to a Different Product")
+with st.sidebar.form("upload_new_product"):
+    uploaded_csv = st.file_uploader("Upload New Product Reviews (CSV)", type=["csv"], key="csv_upload")
+    uploaded_pdf = st.file_uploader("Upload Product Manual (PDF)", type=["pdf"], key="pdf_upload")
+    submit_product = st.form_submit_button("Upload New Product")
+
+    if submit_product:
         try:
-            query_embed = embedder.encode([query]).tolist()
-            results = collection.query(query_embeddings=query_embed, n_results=20)
-            docs = results["documents"][0]
-            metas = results["metadatas"][0]
+            # Reset ChromaDB collection
+            client = chromadb.Client(Settings(persist_directory=CHROMA_PATH, anonymized_telemetry=False))
+            client.delete_collection("reviews")
+            collection = client.get_or_create_collection(name="reviews")
 
-            if rerank_enabled:
-                pairs = [(query, doc) for doc in docs]
-                scores = reranker.predict(pairs).tolist()
-                ranked = sorted(zip(scores, docs, metas), key=lambda x: x[0], reverse=True)[:5]
-            else:
-                ranked = list(zip([1.0]*len(docs), docs, metas))[:5]
+            embedder = get_embedder()
 
-            context = "\n".join([doc for _, doc, _ in ranked])
-            prompt = f"You are a helpful assistant. Only answer questions based on the given context below. If unsure, say 'I don't know'.\n\n{context}\n\nQ: {query}\nA:"
-            response = generator(prompt, max_new_tokens=300)[0]["generated_text"]
-            answer = response.split("A:")[-1].strip()
+            # Process CSV
+            if uploaded_csv:
+                df = pd.read_csv(uploaded_csv)
+                if "reviews.title" in df.columns and "reviews.text" in df.columns:
+                    review_docs = [f"{str(title).strip()}. {str(text).strip()}" for title, text in zip(df["reviews.title"], df["reviews.text"])]
+                    embeddings = embedder.encode(review_docs, batch_size=32).tolist()
+                    collection.add(
+                        documents=review_docs,
+                        embeddings=embeddings,
+                        ids=[f"usercsv_{uuid.uuid4()}_{i}" for i in range(len(review_docs))],
+                        metadatas=[{"source": "user_csv"} for _ in review_docs]
+                    )
+                    st.sidebar.success(f"✅ Uploaded and indexed {len(review_docs)} reviews.")
+                else:
+                    st.sidebar.error("❌ CSV must contain 'reviews.title' and 'reviews.text' columns.")
 
-            st.success("✅ Answer:")
-            st.markdown(f"<div style='background-color:#1f6feb; padding: 1rem; border-radius: 0.5rem; color: white; font-size: 1.2rem;'>{answer}</div>", unsafe_allow_html=True)
+            # Process PDF
+            if uploaded_pdf:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(uploaded_pdf.read())
+                    added_chunks = add_pdf_to_chromadb(collection, tmp.name)
+                    st.sidebar.success(f"✅ Uploaded and indexed {added_chunks} chunks from PDF.")
+                    os.remove(tmp.name)
 
-            if show_sources:
-                st.markdown("---")
-                with st.expander("📎 Source Documents"):
-                    for idx, (_, doc, meta) in enumerate(ranked, 1):
-                        label = meta.get("filename") or "CSV Review"
-                        ts = meta.get("timestamp", "")
-                        st.markdown(f"**Source {idx}:** `{label}` ({ts})")
-                        st.code(doc.strip(), language="markdown")
+            st.session_state.chat_history = []
+            st.sidebar.info("🆕 Product context switched successfully!")
+            st.experimental_rerun()
 
         except Exception as e:
-            st.error(f"❌ Failed to generate answer: {str(e)}")
+            st.sidebar.error(f"❌ Failed to switch product: {e}")
 
-# --- Optional: Clear session button
-if st.button("🧹 Clear Chat & Memory"):
-    st.session_state.clear()
+# ---------------------- Chat UI ----------------------
+st.subheader("💬 Ask a Product Question")
+query = st.text_input("Your question:")
+rerank = st.checkbox("⚙️ Use reranker", value=True)
+show_sources = st.checkbox("📎 Show source documents", value=False)
+
+if st.button("Ask") and query:
+    with st.spinner("Generating answer..."):
+        answer, ranked_docs = ask_question(query, st.session_state.chat_history, collection, rerank)
+        st.session_state.chat_history.append((query, answer))
+        if len(st.session_state.chat_history) > 5:
+            st.session_state.chat_history.pop(0)
+
+        st.success("✅ Answer:")
+        st.markdown(f"**Answer:** {answer}")
+
+        if show_sources:
+            with st.expander("📎 Source Documents"):
+                for i, (_, doc, meta) in enumerate(ranked_docs, 1):
+                    label = meta.get("filename") or "CSV Review"
+                    st.markdown(f"**Source {i}:** `{label}`")
+                    st.code(doc.strip(), language="markdown")
+
+# ---------------------- Clear Chat ----------------------
+if st.button("🧹 Clear Chat"):
+    st.session_state.chat_history = []
     st.experimental_rerun()
 
-# --- Feedback Section
-st.markdown("---")
-st.subheader("📊 Feedback")
-feedback = st.radio("Was this answer helpful?", ("👍 Yes", "👎 No"))
-if feedback:
-    st.success("Thanks for your feedback!")
-
-# --- Analytics Dashboard ---
-st.markdown("---")
-with st.expander("📈 Trends & Insights"):
-    st.markdown("### 🔥 Most Asked Questions")
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-
-    if query:
-        st.session_state.chat_history.append(query)
-    question_counts = Counter(st.session_state.chat_history)
-    most_common = question_counts.most_common(5)
-
-    for q, count in most_common:
-        st.markdown(f"- {q} ({count}x)")
-
-    # Ratings chart (if available)
-    rating_data = pd.read_csv(CSV_PATH)
-    if "reviews.rating" in rating_data.columns:
-        st.markdown("### 🌟 Average Review Ratings")
-        fig, ax = plt.subplots(figsize=(3, 1.5))
-        rating_data["reviews.rating"].value_counts().sort_index().plot(kind="bar", ax=ax, color="#f08804")
-        ax.set_xlabel("Rating")
-        ax.set_ylabel("Count")
-        ax.set_title("Rating Distribution", fontsize=10)
-        st.pyplot(fig)
-
-    # Sentiment over time
-    st.markdown("### 📈 Sentiment Over Time")
-    sentiments = [60, 75, 80, 50, 90]
-    dates = ["Week 1", "Week 2", "Week 3", "Week 4", "Week 5"]
-    fig2, ax2 = plt.subplots(figsize=(3, 1.5))
-    ax2.plot(dates, sentiments, marker='o', color="#0073e6")
-    ax2.set_title("Positive Sentiment Over Time", fontsize=10)
-    ax2.set_ylabel("% Positive")
-    ax2.set_xlabel("Timeline")
-    ax2.grid(True)
-    st.pyplot(fig2)
+# ---------------------- Chat History Display ----------------------
+if st.session_state.chat_history:
+    st.markdown("---")
+    st.subheader("🗨️ Chat History")
+    for q, a in st.session_state.chat_history:
+        st.markdown(f"**You:** {q}")
+        st.markdown(f"**Bot:** {a}")
